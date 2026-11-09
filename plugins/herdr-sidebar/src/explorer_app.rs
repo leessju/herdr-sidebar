@@ -361,6 +361,8 @@ pub struct App {
     /// until the button is released: a release in place runs the configured
     /// click action, a release after dragging drops the file elsewhere.
     press: Option<PendingPress>,
+    /// Copy/Cut source awaiting a Paste: the path and whether it moves.
+    clipboard: Option<(PathBuf, bool)>,
     /// Native pointer-following overlay for the current drag (macOS).
     ghost: Option<herdr_sidebar::ghost::Ghost>,
     /// Raw mouse trace file, when `<state dir>/mouse-debug.log` existed at
@@ -591,6 +593,13 @@ impl PendingPress {
     }
 }
 
+/// Where an in-sidebar drag would MOVE the file on release: the folder, and
+/// the visible row standing for it (`None` = the root, shown by the header).
+struct MoveTarget {
+    dir: PathBuf,
+    row: Option<usize>,
+}
+
 /// Activity-bar click zones from the last draw: the bar's row and the column
 /// ranges of the explorer / source-control icons.
 #[derive(Clone, Copy)]
@@ -685,6 +694,7 @@ impl App {
             mouse_pos: None,
             last_click: None,
             press: None,
+            clipboard: None,
             ghost: None,
             mouse_log: Some(herdr_sidebar::rundir::dir("mouse-debug.log")).filter(|p| p.is_file()),
             last_preview: None,
@@ -1096,7 +1106,15 @@ impl App {
     fn update_drag_notice(&mut self, col: u16, row: u16) {
         let Some(press) = self.press.as_ref().filter(|p| p.dragging) else { return };
         let Some(direction) = self.drop_direction(press, col) else {
-            self.show_drag_notice();
+            let name = press
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.notice = Some(match self.move_target(press, row) {
+                Ok(t) => format!("⇣ move {name} → {}/", self.folder_label(&t.dir)),
+                Err(why) => format!("⇣ {name}: {why} (release to cancel)"),
+            });
             return;
         };
         let my_id = self.pane_ctl.as_ref().map(|c| c.pane_id.as_str()).unwrap_or("");
@@ -1118,7 +1136,75 @@ impl App {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        self.notice = Some(format!("⇢ {name}  (drop on a pane · release here to cancel)"));
+        self.notice = Some(format!("⇢ {name}  (drop on a folder to move · on a pane to send)"));
+    }
+
+    /// The folder an in-sidebar release at pane row `row` would move the
+    /// dragged entry into: a folder row itself, a file row's parent, or the
+    /// root below the last row. `Err` names why the release would be a no-op.
+    fn move_target(&self, press: &PendingPress, row: u16) -> Result<MoveTarget, &'static str> {
+        let root = self.tree.root_path();
+        let (dir, index) = match self.row_at(row).and_then(|i| self.rows.get(i).map(|r| (i, r))) {
+            Some((i, r)) if r.is_dir => (r.path.clone(), Some(i)),
+            Some((_, r)) => {
+                let parent = r.path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone());
+                let index = self.rows.iter().position(|x| x.path == parent);
+                (parent, index)
+            }
+            None => (root, None),
+        };
+        if press.path.parent() == Some(dir.as_path()) {
+            return Err("already in this folder");
+        }
+        if dir.starts_with(&press.path) {
+            return Err("cannot move a folder into itself");
+        }
+        Ok(MoveTarget { dir, row: index })
+    }
+
+    /// The in-sidebar move target under the pointer right now, if the drag
+    /// is inside the pane and the release would do something.
+    fn live_move_target(&self) -> Option<MoveTarget> {
+        let press = self.press.as_ref().filter(|p| p.dragging)?;
+        let (col, row) = self.mouse_pos?;
+        if self.drop_direction(press, col).is_some() {
+            return None;
+        }
+        self.move_target(press, row).ok()
+    }
+
+    /// A folder for notices: its path relative to the root, or the root's name.
+    fn folder_label(&self, dir: &Path) -> String {
+        match dir.strip_prefix(self.tree.root_path()) {
+            Ok(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
+            _ => self.tree.root_name(),
+        }
+    }
+
+    /// Release inside the sidebar: move the dragged entry into the folder
+    /// under the pointer (see [`Self::move_target`]).
+    fn move_file(&mut self, press: &PendingPress, row: u16) {
+        let name = press
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let target = match self.move_target(press, row) {
+            Ok(t) => t,
+            Err(why) => {
+                self.notice = Some(format!("{name}: {why}"));
+                return;
+            }
+        };
+        match actions::move_into(&press.path, &target.dir) {
+            Ok(moved) => {
+                self.tree.expand(&target.dir);
+                self.reveal_created(&moved);
+                self.request_decorations(true);
+                self.notice = Some(format!("moved {name} → {}/", self.folder_label(&target.dir)));
+            }
+            Err(err) => self.notice = Some(format!("move failed: {err}")),
+        }
     }
 
     /// Did a drag end beyond our edge? herdr keeps routing a drag to the
@@ -1669,9 +1755,9 @@ impl App {
                 if let Some(press) = self.end_drag() {
                     match self.drop_direction(&press, mouse.column) {
                         Some(direction) => self.drop_file(&press.path, direction, mouse.row),
-                        // A drag released back inside the sidebar is a
-                        // cancelled drag, not a click.
-                        None if press.dragging => self.notice = Some("drag cancelled".into()),
+                        // A drag released back inside the sidebar moves the
+                        // entry into the folder under the pointer.
+                        None if press.dragging => self.move_file(&press, mouse.row),
                         None => self.click_file(&press.path, press.double),
                     }
                 }
@@ -1763,7 +1849,11 @@ impl App {
         let in_repo = target
             .as_ref()
             .is_some_and(|(path, _)| Git::owner_of(path).is_ok());
-        let entries = actions::menu_entries(target.as_ref().map(|(_, is_dir)| *is_dir), in_repo);
+        let entries = actions::menu_entries(
+            target.as_ref().map(|(_, is_dir)| *is_dir),
+            in_repo,
+            self.clipboard.is_some(),
+        );
         let selected = entries
             .iter()
             .position(|e| matches!(e, MenuEntry::Action(..)))
@@ -3217,6 +3307,27 @@ impl App {
                 let Some((path, is_dir)) = target else { return };
                 self.overlay = Some(Overlay::ConfirmDelete { path, is_dir });
             }
+            MenuAction::Copy | MenuAction::Cut => {
+                let Some((path, _)) = target else { return };
+                let cut = action == MenuAction::Cut;
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.notice = Some(format!(
+                    "{}: {name} — Paste from the menu",
+                    if cut { "cut" } else { "copied" }
+                ));
+                self.clipboard = Some((path, cut));
+            }
+            MenuAction::Paste => self.paste_into(&create_dir),
+            MenuAction::Duplicate => {
+                let Some((path, _)) = target else { return };
+                match actions::duplicate(&path) {
+                    Ok(created) => self.reveal_created(&created),
+                    Err(err) => self.notice = Some(format!("duplicate failed: {err}")),
+                }
+            }
             MenuAction::OpenExternal => {
                 let Some((path, _)) = target else { return };
                 let name = path
@@ -3239,6 +3350,45 @@ impl App {
             MenuAction::ChangeFolder => self.change_folder_dialog(),
             MenuAction::ChangeFolderTyped => self.change_folder_prompt(),
             MenuAction::PaneFolder => self.reset_to_pane_folder(),
+        }
+    }
+
+    /// "Paste": copy or move the remembered entry into `dir`. A cut entry is
+    /// forgotten once it has moved (pasting it twice would move it twice); a
+    /// copied one stays available for further pastes, like VS Code.
+    fn paste_into(&mut self, dir: &Path) {
+        let Some((src, cut)) = self.clipboard.clone() else {
+            self.notice = Some("nothing to paste".into());
+            return;
+        };
+        if !src.exists() {
+            self.clipboard = None;
+            self.notice = Some(format!("paste failed: {} no longer exists", src.display()));
+            return;
+        }
+        let result = if cut {
+            actions::move_into(&src, dir)
+        } else {
+            actions::copy_into(&src, dir)
+        };
+        match result {
+            Ok(created) => {
+                if cut {
+                    self.clipboard = None;
+                }
+                self.tree.expand(dir);
+                self.reveal_created(&created);
+                self.request_decorations(true);
+            }
+            Err(err) => self.notice = Some(format!("paste failed: {err}")),
+        }
+    }
+
+    /// Refresh the tree after a filesystem change and select `created`.
+    fn reveal_created(&mut self, created: &Path) {
+        self.refresh_tree();
+        if let Some(index) = self.rows.iter().position(|r| r.path == created) {
+            self.select(index);
         }
     }
 
@@ -3660,6 +3810,7 @@ impl App {
             let theme = self.theme;
             let hovered = self.hovered;
             let selected = self.selected;
+            let drop_row = self.live_move_target().map(|t| t.row);
             let items: Vec<ListItem> = self
                 .rows
                 .iter()
@@ -3672,6 +3823,7 @@ impl App {
                         theme,
                         hovered == Some(i),
                         selected == Some(i),
+                        drop_row == Some(Some(i)),
                         self.row_deco(r),
                         body.width,
                     )
@@ -3679,6 +3831,17 @@ impl App {
                 .collect();
             frame.render_widget(List::new(items), body);
             draw_scrollbar(frame, body, self.rows.len(), h, self.scroll);
+            // Dropping into the ROOT has no row to light up: frame the whole
+            // tree body instead so the target is still unmistakable.
+            if drop_row == Some(None) {
+                let style = drop_target_style();
+                frame.render_widget(Block::default().style(style), Rect::new(body.x, body.y, 1, body.height));
+                frame.render_widget(
+                    Block::default().style(style),
+                    Rect::new(body.x + body.width.saturating_sub(1), body.y, 1, body.height),
+                );
+                frame.render_widget(Block::default().style(style), header);
+            }
         }
         self.body = BodyGeom {
             top: body.y,
@@ -5177,14 +5340,24 @@ fn row_item(
     theme: IconTheme,
     hovered: bool,
     selected: bool,
+    drop_target: bool,
     deco: Option<char>,
     width: u16,
 ) -> ListItem<'static> {
     let item = ListItem::new(row_line(row, theme, deco, width));
+    if drop_target {
+        return item.style(drop_target_style());
+    }
     match row_bg(hovered, selected) {
         Some(style) => item.style(style),
         None => item,
     }
+}
+
+/// The folder about to receive a dragged file: a steady accent fill with
+/// bold white text, distinct from the grey selection and hover backgrounds.
+fn drop_target_style() -> Style {
+    Style::default().bg(palette().accent_focus).fg(Color::White).bold()
 }
 
 /// The selection / hover BACKGROUND for a row, if any. Kept apart from the
@@ -5375,7 +5548,7 @@ mod tests {
 
     #[test]
     fn menu_navigation_skips_separators_and_clamps() {
-        let entries = actions::menu_entries(Some(false), true);
+        let entries = actions::menu_entries(Some(false), true, false);
         // First entry is an action; stepping up from it stays put.
         assert_eq!(step_menu(&entries, 0, -1), 0);
         // Stepping down over a separator lands on the next action.
